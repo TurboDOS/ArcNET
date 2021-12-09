@@ -1,0 +1,612 @@
+	#page	132
+	#TITLE	"Enet-S100 16bit Interface Driver"
+	#SUBTTL	"(c)1986 By Earth Computers, Inc"
+; This driver is for TurboDOS 1.43!!
+; For Earth Computers ArcNet S100 (ENET-100) card
+;
+
+	Module	"ENETS100"
+	#page
+
+; ARCNET CONTROLLER REGISTER OFFSETS
+;
+INTMSK:	EQU	0			; COM 9026 interrupt mask register
+STATUS:	EQU	0			; COM 9026 status register
+COMAND:	EQU	1			; COM 9026 command register
+MSGBFR: EQU	2			; read/write port for 2k buffer
+BUFLOW:	EQU	3			; buffer low address init register
+BUFHI:	EQU	4			; buffer high address init register
+RESET:	EQU	5			; COM 9026 reset port
+;
+; COM 9026 COMMAND SET
+;
+DISXMT:	EQU	1			; disable transmitter command
+DISRCV:	EQU	2			; disable receiver command
+ENAXMT:	EQU	3			; enable transmitter command
+ENARCV:	EQU	4			; enable receiver command
+DEFCON:	EQU	5			; define configuration command
+CLRFLG:	EQU	6			; clear flags command
+;
+; STATUS REGISTER DEFINITION
+;
+TA:	EQU	1<<0			; transmitter available bit
+TMA:	EQU	1<<1			; transmit message acknowledged bit
+RECON:	EQU	1<<2			; re-configuration bit
+TST:	EQU	1<<3			; test mode bit
+POR:	EQU	1<<4			; power-on reset bit
+ETS1:	EQU	1<<5			; extended timeout status 1 bit
+ETS2:	EQU	1<<6			; extended timeout status 2 bit
+RI:	EQU	1<<7			; receiver inhibited bit
+;
+; NODTBL FLAG BYTE STATUS DEFINITIONS
+;
+RQDNLD:	EQU	1<<0			; download requested by this node
+SNDNLD:	EQU	1<<1			; sending download to this node
+RECFLG:	EQU	1<<2			; message received from this node
+SNTFLG:	EQU	1<<3			; message sent to this node
+SNDFLG:	EQU	1<<4			; sending message to this node
+SPARE1:	EQU	1<<5			; 
+SPARE2:	EQU	1<<6			; 
+DEDFLG:	EQU	1<<7			; this node has been reported dead
+	#page
+
+	LOC	Code#
+
+; THIS IS THE CIRCUIT DRIVER INITIALIZATION ENTRY
+
+CKTIN_::
+	MOV	DX,ARCIO_		; get port base
+	TEST	BYTE ARCRP_,=-1		; is reset supported ?
+	JNZ	RST9026			; yes, go do it
+	IN	AL,DX			; read 9026 status reg
+	TEST	AL,=POR			; is this power-on rset ?
+	JNZ	COLDST			; yes, go do cold start
+	MOV	AX,=0x07FE		; point to last buffer byte8-1
+	CALL	BUFADDR			; address the buffer
+	IN	AL,DX			; get last buffer byte-1
+	MOV	AH,AL			; save in ah
+	IN	AL,DX			; get last buffer byte
+	JMPS	SAVNODE
+
+RST9026:
+	ADD	DX,=RESET		; offset to reset port
+	IN	AL,DX			; reset the lan board
+	MOV	CX,=200			; get the count
+DELAY:
+	MOV	AX,=800			; load 1ms timing count
+DELAY1:
+	DEC	AX			; count this
+	JNZ	DELAY1			; 1ms delay
+	LOOP	DELAY			; delay for 200ms reset
+COLDST:
+	MOV	AX,=0x0000		; point to first buffer byte
+	CALL	BUFADDR			; address the buffer
+	IN	AL,DX			; get first buffer byte
+	MOV	CH,AL			; save in ch
+	IN	AL,DX			; get second buffer byte
+	MOV	CL,AL			; save in cl
+	MOV	AX,=0x07FE		; point to last buffer byte-1
+	CALL	BUFADDR			; address the buffer
+	MOV	AL,CH			; fetch first buffer byte
+	OUT	DX,AL			; save first @ last-1
+	MOV	AL,CL			; fetch second buffer byte
+	OUT	DX,AL			; save second @ last
+	XCHG	AX,CX			; re-load ax
+SAVNODE:
+	CMP	AH,=0xD1		; board present ?
+	JNZ	NOBOARD			; no, remove circuit & exit
+	MOV	NODE,AL			; save the lan board node #
+	MOV	DX,ARCIO_		; fetch I/O base
+	XOR	AL,AL			; get interrupt mask
+	OUT	DX,AL			; load it
+	INC	DX			; point to 9026 command reg
+	MOV	AL,=CLRFLG|0x18		; clear the flags
+	OUT	DX,AL
+	MOV	AL,=DISXMT		; disable transmitter
+	OUT	DX,AL
+	MOV	AL,=DISRCV		; disable receiver
+	OUT	DX,AL
+	MOV	AL,=DEFCON		; define configuration
+	OUT	DX,AL
+	MOV	CL,NMBCKT#		; fetch # circuits
+	XOR	CH,CH			; clear upper reg
+	JCXZ	CKTINX			; quit if none
+	MOV	BX,&CKTAST#		; point to cktast table
+	MOV	AX,&CKTDR_		; get this cir driver address
+SCANLP:
+	CMP	AX,2[BX]		; is this our table loc ?
+	JZ	PATCH			; yes, go patch table
+	ADD	BX,=4			; next address in table
+	LOOP	SCANLP			; loop til found or done
+	JMPS	CKTINX			; done
+
+PATCH:
+	MOV	AL,1[BX]		; fetch circuit # from table
+	MOV	CKTNMB,AL		; save circuit #
+	MOV	AL,NODE			; fetch lan node #
+	MOV	[BX],AL			; patch node # in cktast table
+	MOV	AL,CKTNMB		; tell Tdos this circuit #
+	CALL	PTMCKT#
+	MOV	AL,NODE			; tell Tdos this node #
+	CALL	PTMNOD#
+CKTINX:
+	RET
+
+NOBOARD:
+	DEC	BYTE NMBCKT#		; remove the ARCnet circuit
+	RET				; done
+
+; THIS IS THE ARCNET CIRCUIT DRIVER ENTRY
+
+CKTDR_::
+	ADD	DX,=4			; skip linkage bytes in message
+	OR	CL,CL
+	JZ	RCVMSG			; recieve a message if cl=0
+	DEC	CL
+	JZ	SNDJMP			; send a message if cl=1
+	RET				; else, return
+
+SNDJMP:
+	JMP	SNDMSG			; go send a message
+
+; COME HERE TO RECIEVE A NETWORK MESSAGE
+
+RCVMSG:
+	MOV	BX,DX			; get message address in bx
+	MOV	AL,[BX]			; fetch max message length
+	MOV	MAXLEN,AL		; save max message length
+	PUSH	DX			; save Tdos message address
+	MOV	BX,&RMXSPH		; get receive mx semaphore
+	CALL	WAIT#			; wait on mutual exclusion
+RCVMSG1:
+	MOV	DX,ARCIO_		; get I/O base
+	INC	DX			; point to 9026 command reg
+	MOV	AL,=ENARCV		; enable receiver to buffer 0
+	OUT	DX,AL			; send command
+	DEC	DX			; point to 9026 status reg
+	IN	AL,DX			; read 9026 status
+	TEST	AL,=RI			; receiver inhibited ?
+	JNZ	NOPOLL			; yes, message is ready, skip poll
+	MOV	DX,&RCVPLK		; get receive poll structure
+	CALL	LNKPOL#			; link poll routine on poll list
+	MOV	BX,&RCVSPH		; get receive message semaphore
+	CALL	WAIT#			; wait for input message
+NOPOLL:
+	MOV	BX,&FIFOMX		; lock access to controller buffer
+	CALL	WAIT#
+	MOV	AX,=0x0002		; point to third buffer byte
+	CALL	BUFADDR			; set buffer address registers
+	IN	AL,DX			; get receive buffer count
+	XOR	AH,AH			; ax = buffer message start
+	MOV	CX,=0x0100		; remove the com9026 bias
+	SUB	CX,AX			; cx = message length
+	CALL	BUFADDR			; set address registers
+	POP	BX			; bx = Tdos destination address
+	PUSH	BX			; save again on stack
+	PUSH	CX			; save message length on stack
+	PUSH	DI			; save Tdos pointer
+	MOV	DI,BX			; get Tdos destination address
+	MOV	AX,DS			; use data segment
+	MOV	ES,AX
+	CLD				; increment addresses
+	REP
+	INS	BYTE,DX			; move cx bytes from the rec buffer
+	POP	DI			; restore Tdos pointer
+	MOV	BX,&FIFOMX		; un-lock buffer access
+	CALL	SIGNAL#
+	POP	CX			; get message length back in cx
+	POP	BX			; Tdos message address to bx
+	CMP	CL,MAXLEN		; maximum message length exceeded ?
+	JA	RCVERR			; if so, network error
+	MOV	CX,4[BX]		; get network source address
+	CMP	CH,CKTNMB		; is it this circuit ?
+	JNZ	RCVOKX			; no, exit with good message
+	XOR	CH,CH			; our circuit, need a download ?
+	XCHG	BX,CX			; nodtbl offset to bx
+	TEST	BYTE NODTBL[BX],=RQDNLD ; this node requesting a download ?
+	XCHG	BX,CX			; message address to bx
+	JZ	CKRCVERR		; no, go see if error & exit
+	PUSH	BX			; Tdos message address back on stack
+	JMP	RCVMSG1			; wait for download to clear flag
+
+CKRCVERR:
+	CMP	BYTE [BX],=12		; was message length a download ?
+	JNZ	RCVOK			; no, good message
+	CMP	BYTE 0x0B[BX],=0x05	; is a download requested ?
+	JZ	SETDOWN			; yes, set node status to download
+	CMP	BYTE 0x0B[BX],=0x15	; ?
+	JZ	RCVERR			; error, go exit with network address
+RCVOK:
+	MOV	BX,&NODTBL		; point to node status table
+	ADD	BX,CX			; offset to proper node
+	OR	BYTE [BX],=RECFLG	; flag message received from this node
+RCVOKX:
+	MOV	BX,&RMXSPH		; get receive mx semaphore
+	CALL	SIGNAL#			; release mutual exclusion
+	XOR	AL,AL			; set return ok
+	RET
+
+SETDOWN:
+	XCHG	BX,CX			; nodtbl offset to bx
+	OR	BYTE NODTBL[BX],=RQDNLD ; flag node requesting download
+	MOV	BX,CX			; message address to bx
+RCVERR:
+	MOV	DX,4[BX]		; fetch network source address
+RCVERRX:
+	PUSH	DX			; save error network address
+	MOV	BX,&RMXSPH		; get receive mx semaphore
+	CALL	SIGNAL#			; release mutual exclusion
+	POP	DX			; restore network error address
+	OR	AL,=-1			; set return with error
+	RET
+
+; RECEIVE MESSAGE POLL ROUTINE 
+
+RCVPOL:
+	MOV	DX,ARCIO_		; fetch I/O base
+	IN	AL,DX			; read 9026 status reg
+	TEST	AL,=RI			; receiver inhibited ?
+	JNZ	RCVSIG			; yes, message is ready
+	RET				; return for another try
+
+RCVSIG:
+	MOV	BX,&RCVPLK		; done for now 
+	CALL	UNLINK#			; un-link & signal Tdos
+	MOV	BX,&RCVSPH
+	JMP	SIGNAL#			; signal process as ready & ret
+
+; COME HERE TO SEND A NETWORK MESSAGE
+
+SNDMSG:
+	MOV	BX,DX			; save Tdos message address in bx
+	MOV	CX,1[BX]		; fetch network destination address
+	CMP	CH,CKTNMB		; is it our circuit ?
+	JZ	CKSTBL1			; yes, go check node status table
+	MOV	BX,&LANFWT#		; else, fetch forwarding table address
+	CALL	CHKUND			; see if table undefined
+	JZ	SNDXIT			; yes, can't foreward, exit 
+SCANFWD:
+	CMP	BYTE [BX],=-1		; is this the table end ?
+	JZ	SNDXIT			; yes, exit
+	CMP	CH,[BX]			; no, is it the circuit to foreward ?
+	JZ	NEWCIR			; yes, g use new circuit
+	ADD	BX,=2			; next entry
+	JMPS	SCANFWD			; look agaiHn
+
+SNDXIT:
+	MOV	BX,DX			; get Tdos message address
+	TEST	BYTE [BX],=-1		; message empty ?
+	JZ	SNDOK			; yes, dummy message
+	JMP	SNDERROR		; else, show message send error
+
+SNDOK:
+	XOR	AL,AL			; dummy message, signal good send
+	RET
+
+NEWCIR:
+	MOV	CL,1[BX]		; fetch new circuit from table
+CKSTBL1:
+	XOR	CH,CH			; zero ch for add
+	MOV	BX,&NODTBL		; point to node status table
+	ADD	BX,CX			; offset to proper node
+	XCHG	BX,DX			; get Tdos message address
+	MOV	AL,[BX]			; fetch message length
+	XCHG	BX,DX			; return node table offset
+	TEST	AL,AL			; message length 0 ?
+	JNZ	CKSTBL2			; no, go send message
+	TEST	BYTE [BX],=RQDNLD	; this node requesting a download ?
+	JNZ	GETSUFIX		; yes, get the suffix character
+	XOR	AL,AL			; else, signal good send & exit
+	RET
+
+GETSUFIX:
+	AND	BYTE [BX],=~RQDNLD	; clear download request flag
+	OR	BYTE [BX],=SNDNLD	; set sending download flag
+	MOV	BP,BX			; save nodtbl pointer
+	MOV	BX,&ARCST_		; point to suffix table
+	ADD	BX,CX			; offset to this node
+	MOV	AL,[BX]			; fetch table suffix
+	MOV	BX,DX			; get Tdos message address
+	MOV	0x0B[BX],AL		; save suffix char in message
+	MOV	BYTE [BX],=12		; set download value msg length
+	MOV	AL,NODE			; fetch this node #
+	MOV	AH,CKTNMB		; fetch this circuit #
+	MOV	4[BX],AX		; save this address as msg source
+	MOV	BX,BP			; restore nodtbl pointer
+	JMPS	SENDIT
+
+CKSTBL2:
+	TEST	BYTE [BX],=SNDNLD	; is this node downloading ?
+	JZ	SENDIT			; no, go send message
+	CMP	AL,=12			; yes, is download complete ?
+	JZ	DNLDDONE		; yes, wrap up download
+	CMP	AL,=128+11		; is this a 128 byte record ?
+	JZ	SENDIT			; yes, send message
+	JMP	SNDERROR		; else, must be error
+
+DNLDDONE:
+	AND	BYTE [BX],=~SNDNLD	; yes, clear downloading flag
+SENDIT:					;  and send last download record
+	OR	BYTE [BX],=SNDFLG	; flag attempt to send to this node
+	PUSH	DX			; save Tdos message address
+	PUSH	CX			; save circuit address
+	CALL	GETBFR			; get send buffer table pointer
+	PUSH	BX			; save buffer table pointer
+	MOV	BX,&FIFOMX		; lock access to controller buffer
+	CALL	WAIT#
+	POP	BX			; restore buffer table pointer
+	MOV	AX,2[BX]		; fetch buffer pointer from table
+	MOV	BP,AX			; save buffer pointer in bp
+	CALL	BUFADDR			; set controller address register
+	MOV	AL,NODE			; fetch this node #
+	OUT	DX,AL			; save node # in buffer
+	POP	AX			; circuit address to ax
+	OUT	DX,AL			; save circuit # in buffer
+	POP	ES			; get Tdos message address
+	PUSH	ES			; save again
+	PUSH	BX			; save buffer table pionter again
+	MOV	BX,ES			; Tdos message pointer to bx
+	MOV	CL,[BX]			; fetch message length
+	XOR	CH,CH			; cx = message size
+	MOV	AX,=0x0100		; prepare com9026 bias
+	SUB	AX,CX			; calc transmit buffer count
+	OUT	DX,AL			; save count in buffer
+	ADD	AX,BP			; calc buffer start address
+	CALL	BUFADDR			; set controller address register
+	PUSH	SI			; save Tdos pointer
+	MOV	SI,ES			; si = Tdos message source
+	CLD				; increment addresses
+	REP
+	OUTS	DX,BYTE			; move cx bytes to the xmit buffer
+	POP	SI			; restore Tdos pointer
+	MOV	BX,&FIFOMX		; release controller buffer access
+	CALL	SIGNAL#
+	MOV	BX,&SMXSPH		; get mutual exclusion semaphore
+	CALL	WAIT#			; only one message at a time
+	POP	BX			; restore send buffer table pointer
+	PUSH	BX			; save again
+	MOV	DX,ARCIO_		; get I/O base
+	INC	DX			; point to 9026 command reg
+	MOV	AL,=CLRFLG|0x18		; get clear flags command
+	OUT	DX,AL			; clear flags for next time
+	MOV	AL,1[BX]		; fetch 9026 command from table
+	OUT	DX,AL			; send buffer command
+	MOV	AX,ARCTC_		; get send tme delay
+	MOV	CNTSAV,AX		; pre-set timer
+	MOV	AL,TICCNT#		; get current tic count
+	MOV	TICSAV,AL		; save current tic count
+	MOV	DX,&SNDPLK		; get send poll structure
+	CALL	LNKPOL#			; link poll routine on poll list
+	MOV	BX,&SNDSPH		; get send message semaphore
+	CALL	WAIT#			; wait for transmitter available
+	POP	BX			; restore buffer table pointer
+	MOV	DX,ARCIO_		; get I/O base
+	IN	AL,DX			; read 9026 status reg
+	TEST	AL,=TA			; is transmitter available ?
+	JZ	XMITOFF			; no, go disable xmit & set error
+	TEST	AL,=TMA			; transmit msg acknowledged ?
+	JZ	DEADNODE		; no, go show dead node
+	CALL	MXREL			; good send, release mx
+	POP	DX			; restore Tdos message address
+	MOV	BX,DX			; get message pointer in bx
+	MOV	BX,1[BX]		; get message destination id
+	XOR	BH,BH			; clear circuit for table offset
+	AND	BYTE NODTBL[BX],=~DEDFLG ; flag this node alive for now
+	OR	BYTE NODTBL[BX],=SNTFLG	 ; flag message sent to this node
+	AND	BYTE NODTBL[BX],=~SNDFLG ; flag send complete to this node
+	XOR	AL,AL			; set successful transmit
+	RET				; done
+
+XMITOFF:
+	INC	DX			; point to 9026 command reg
+	MOV	AL,=DISXMT		; disable transmitter
+	OUT	DX,AL			; send command
+	CALL	MXREL			; release mx
+	POP	DX			; restore Tdos message address
+SNDERROR:
+	MOV	BX,DX			; get Tdos message pointer in bx
+	MOV	DX,1[BX]		; get message destination id
+	OR	AL,=-1			; set error return code
+	RET
+
+DEADNODE:
+	CALL	MXREL			; release mx
+	POP	BX			; get Tdos message pointer in bx
+	MOV	DX,1[BX]		; get message destination id
+	MOV	BL,DL			; get destination node
+	XOR	BH,BH			; clear bh for table offset
+	OR	BYTE NODTBL[BX],=DEDFLG	; flag this node dead for now
+	OR	AL,=-1			; set error return code
+	RET
+
+MXREL:
+	MOV	BYTE [BX],=0		; free up this send buffer
+	MOV	BX,&BMXSPH		; get buffer mx semaphore
+	CALL	SIGNAL#			; allow another process into getbfr
+	MOV	BX,&SMXSPH		; get send mx semaphore
+	JMP	SIGNAL#			; release mutual exclusion & ret
+
+; GET 1 OF 3 TRANSMIT BUFFER TABLE POINTERS IN BX...OR WAIT TIL AVAILABLE
+
+GETBFR:
+	MOV	BX,&BMXSPH		; allow only 3 processes in getbfr
+	CALL	WAIT#			; wait here if all 3 in use
+	CLI				; disable interrupts
+	MOV	BX,&SBFRTBL		; point to send buffer cntrol table
+	MOV	CX,=3			; try all 3 send buffers
+TBLLOOP:
+	TEST	BYTE [BX],=-1		; is this one in use ?
+	JZ	GETBFRX			; no, use it
+	ADD	BX,=4			; next buffer set
+	LOOP	TBLLOOP			; try again
+	POP	AX			; pop return address from stack
+	POP	CX			; restore stack for error
+	POP	DX			; we got here because more than 3
+	STI				; enable interrupts
+	JMP	SNDERROR		; processes got in....never happens
+
+GETBFRX:
+	MOV	BYTE [BX],=-1		; set in-use flag in table
+	STI				; enable interrupts
+	RET				; ret w/buffer pointer in BX
+
+; SEND MESSAGE POLL ROUTINE
+
+SNDPOL:
+	MOV	DX,ARCIO_		; get I/O base
+	IN	AL,DX			; read 9026 status reg
+	TEST	AL,=TA			; is transmitter available ?
+	JNZ	SNDSIG			; yes, signal polling done
+	TEST	BYTE ARCTF_,=-1		; are we timing this ?
+	JZ	SNDPOLX			; no, exit
+	MOV	AL,TICCNT#		; else, get current tic count
+	CMP	AL,TICSAV		; has it changed since last time ?
+	JZ	SNDPOLX			; no, exit
+	MOV	TICSAV,AL		; else, save new count
+	DEC	WORD CNTSAV		; count this tick
+	JZ	SNDSIG			; wait no more if count = 0
+SNDPOLX:
+	RET				; try again
+
+SNDSIG:
+	MOV	BX,&SNDPLK		; get send poll structure
+	CALL	UNLINK#			; unlink poll routine from poll list
+	MOV	BX,&SNDSPH		; get send message semaphore
+	JMP	SIGNAL#			; signal process as ready & ret
+
+; SET 2K BUFFER INDEX REGISTER PER AX & LEAVE DX AT BUFFER IO PORT
+
+BUFADDR:
+	MOV	DX,ARCIO_		; get the port base in DX
+	ADD	DX,=BUFLOW		; offset for buffer index register
+	OUT	DX,AL			; set buffer low index register
+	INC	DX			; offset to high register
+	MOV	AL,AH			; get high value in AL
+	OUT	DX,AL			; set buffer high index register
+	DEC	DX			; offset for buffer I/O port
+	DEC	DX
+	RET
+
+; CHECK IF BX CONTAINS THE ADDRESS OF TDOS UNDEFINED CODE AND/OR DATA LABLES
+
+CHKUND:
+	CMP	BX,&UndCode#		; bx = undefined code address ?
+	JZ	CHKUNDX			; yes, exit
+	CMP	BX,&UndData#		; bx = undefined data address ?
+CHKUNDX:
+	RET				; zflag set if match found
+	#page
+
+	LOC	Data#
+
+; THIS IS THE DATA SEGMENT AREA
+
+	align
+ARCSG_::	
+	DW	0xF780			; network buffer segment value
+ARCIO_::	
+	DW	0x00D0			; controller I/O base address value
+ARCRP_::
+	DB	0			; network reset present flag
+ARCTF_::
+	DB	-1			; send message timeout enable flag
+ARCTC_::
+	DW	0x0020			; send timeout count value
+CKTNMB:
+	DB	0			; this circuit number save
+NODE:
+	DB	0			; this node number save
+SBFRTBL:	
+	DB	0			; buffer 1 in-use flag
+	DB	0x0B			; buffer 1 9026 command
+	DW	0x0200			; buffer 1 start address
+
+	DB	0			; buffer 2 in-use flag
+	DB	0x13			; buffer 2 9026 command
+	DW	0x0400			; buffer 2 start address
+
+	DB	0			; buffer 3 in-use flag
+	DB	0x1B			; buffer 3 9026 command
+	DW	0x0600			; buffer 3 start address
+
+MAXLEN:	
+	DB	0			; max message length save
+TICSAV:
+	DB	0			; send clock tic count save
+CNTSAV:
+	DW	0			; send timer count save
+RMXSPH:					
+	DW	1			; receive mutual exclusion semaphore
+	DW	$
+	DW	$-2
+RCVSPH:					
+	DW	0			; receive message semaphore
+	DW	$
+	DW	$-2
+RCVPLK:					
+        DW      0    			; receive message poll linkage
+        DW      0    
+	DW	&RCVPOL
+
+SMXSPH:					
+	DW	1			; send mutual exclusion semaphore
+	DW	$
+	DW	$-2
+SNDSPH:					
+	DW	0			; send message semaphore
+	DW	$
+	DW	$-2
+SNDPLK:					
+        DW      0    			; send message poll linkage
+        DW      0    
+	DW	&SNDPOL
+
+BMXSPH:
+	DW	3			; send buffer mutual excl semaphore
+	DW	$			; allow 3 processes to enter
+	DW	$-2
+
+FIFOMX:
+	DW	1			; fifo move mutual excl semaphore
+	DW	$
+	DW	$-2
+
+; NETWORK DOWNLOAD NODE SUFFIX TABLE
+
+ARCST_::	
+	DB	"                          "
+	DB	"                          "
+	DB	"                          "
+	DB	"                          "
+	DB	"                          "
+	DB	"                          "
+	DB	"                          "
+	DB	"                          "
+	DB	"                          "
+	DB	"                      "
+
+; NETWORK DOWNLOAD NODE STATUS TABLE
+
+NODTBL:	
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0,0,0,0,0,0,0,0,0,0,0
+	DB	0,0,0,0
+
+	END
+
