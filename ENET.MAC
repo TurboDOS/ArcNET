@@ -1,0 +1,446 @@
+Title	Turbodos arcnet circuit driver for the Earth-net 100
+Subttl	Version: 1.1
+.z80
+
+;	author : randy schafer
+;	version: 1.0 date: 05/18/86	; released
+;	version: 1.1 date: 08/23/86	; cleanup k.a.
+
+	name 	('enet')
+
+	dseg
+
+arcbas::dw	30h			; arcnet base port
+
+rxmx:	dw	1			; receiver mutual exlusion
+..rxx:	dw	..rxx			; links
+	dw	..rxx			; links
+
+txmx:	dw	1			; transmit mutual exlucion
+..txx:	dw 	..txx			; links
+	dw	..txx			; links
+
+fifomx:	dw	1			; fifo mutual exlucion
+..fifx:	dw 	..fifx			; links
+	dw	..fifx			; links
+
+rxsph:	dw	0			; read data semaphore
+..rxsp:	dw  	..rxsp			; link
+	dw	..rxsp			; link
+
+txsph:	dw	0			; transmit data semaphor
+..txsp:	dw	..txsp			; link
+	dw	..txsp			; link
+
+ramaddr:ds	1024,0			; arcnet message buffer
+brdflg:	db	0			; board present flag
+
+bptrr:	dw	0			; rcv message area pointer
+bptrt:	dw	0			; xmit message area pointer
+sladr:	dw	0			; slave address for clear buffs
+clrbuf:	db	0			; clear buffer flag
+
+;	buffer clear in process table
+
+bcipt:	dw	-1			; end of table flag
+	ds	512			; 256 entrys
+cnt:	db	0
+
+	common	/?init?/		;  locate in init segment
+
+; circuit driver initialization
+
+cktin@::ld	bc,(arcbas)		; get base of arcnet
+	in	a,(c)			; test for presence
+	cp	-1			; is board there?
+	ret	nz			; exit if so
+	ld	(brdflg),a		; set the flag if no board
+	ret				; done
+
+; start of routines
+
+	cseg
+
+; circuit driver entry point
+
+cktdr@::bit	0,c			; test commands
+	jp	nz,txmsg		; if so then do it
+
+; receive routine (note mutual exclusion)
+
+; downloader error recovery works as follows: the received packet's length
+; is checked for short length packet (total length = 12). if this is not the
+; case then we procede normally.  if it is then we save the slave network 
+; address in sladr and see if the slave's network address is in the buffer  
+; clear in process table, bcipt. if it is then the packet is to be flushed
+; as the packet is being send to an invalid node. if the address is not in
+; the table then it is entered and a flag, clrbuf, is set. we then move the
+; packet into the turbodos area as specified in the network handling protocal.
+; however, upon exit the flag, clrbuf, is checked. if it is active (-1) then
+; we load de with the circuit address of the slave and a with -1 and return.
+; this clears the buffers for that process. turbodos signals completion of
+; this action by transmitting a zero length packet to that slave. the xmit
+; routine clears the table entry for the slave upon receipt of this message.
+
+rcvmsg:	ld	a,(brdflg)		; is board here?
+	or	a			; set flags
+	jr	z,..arc			; jump if here
+	ld	hl,rxmx			; exclude all others
+	call	wait##			; stick here if no board
+
+..arc:	ld	hl,rxmx			; exclude all others
+	call	wait##			; wait if in use
+	ld	bc,(arcbas)		; command port
+	inc	bc			; base+1
+	ld	a,84h			; enable receiver 0
+	out	(c),a			; commanƒ th≈ boardç
+	inc	de			; step de over the linkage
+	inc	de			; step
+	inc	de			; step
+	inc	de			; step
+	ld	(bptrr),de		; save this pointer
+	ld	de,rdpoll		; set up poll routine
+	call	lnkpol##		; link the poll routine
+	ld	hl,rxsph		; wait til recvr full
+	call	wait##			; so wait
+	ld	a,0ffh
+	call	movbuf			; * move arc msg buf to ram
+	call	dwntst		 	; test for downloader error
+	jp	z,flush		 	; if zero then flush buffers
+
+	ld	a,(ramaddr+2)		; get the count
+	ld	e,a			; set up for add
+	ld	d,0			; zero upper bits
+	ld	hl,ramaddr		; set up for add
+	add	hl,de			; hl points to message
+	ld	a,e			; get the count
+	cpl				; un-two's complement count
+	inc	a			; finished
+	ld	c,a			; set up count in bc
+	ld	b,0			; set up
+	ld	de,(bptrr)		; get buffer address
+	ldir				; move message to msg area
+
+	ld	a,(clrbuf)		; get clear buffer flag
+	or	a		 	; active -1
+	jr	z,rc1		 	; if not active then normal exit
+	ld	a,0			; reset the flag
+	ld	(clrbuf),a		; reset
+	ld	de,(sladr)		; get address of slave
+	ld	hl,rxmx			; release routine 
+	call	signal##		; for others to use
+	ld	a,-1			; clear buffer command
+	ret	
+
+rc1:	ld	hl,rxmx			; remove mutual exclusion
+	call	signal##		; others can use now
+	xor	a			; clear a
+	ret				; and git
+
+;	this routine flushes the current packet if a clear buffers command
+;	has been issued to the o/s and not been acknowleged for the particular
+;	slave.
+
+flush:	ld	hl,rxmx			; release semaphore
+	call	signal##	
+	jp	rcvmsg			; wait for next packet
+
+;	this routine searches the clear buffers table. if the network address
+;	contained in de is found in the table then the routine returns with
+;	a = 0. if the entry is not found then a = -1.
+
+srchtbl:ld	hl,bcipt		; get table address
+sblp:	ld	a,(hl)			; get the low order byte
+	cp	0ffh			; check for end of table
+	jr	nz,look			; if not then compare de to (hl)
+	inc	hl			; next byte
+	ld	a,(hl)			; both bytes must be 0ffh
+	cp	0ffh			; see if end of table
+	ld	a,-1			; not found flag
+	ret 	z			; return if not found
+	dec	hl			; look at low order byte again
+look:	ld  	a,(hl)			; get the byte
+	cp	e			; compare to test value
+	jr	nz,sb1			; if not equal then try again
+	inc	hl			; look at next byte
+	ld	a,(hl)		 	; get the high order byte
+	cp	d			; compare to test value
+	ld      a,0			; found flag, a=0	
+	ret	z		 	; return if found
+	inc	hl			; if not look at next entry
+	jp	sblp			; loop
+sb1:	inc	hl			; move hl to next entry
+	inc	hl
+	jp	sblp			; try to match next entry
+
+;	this routine checks the current packet's length.  if it is not
+;	12 then it returns. if it is then we have a clear buffers request
+;	from the slave.  if packet's source id is in the clear buffers
+;	table then we return with zero set; this indicates that the 
+;	packet is to be flushed. otherwise the id is entered into the
+;	table and the clear buffer flag (clrbuf) is set.   
+
+dwntst:	ld	a,(ramaddr+2)		; get the packet start addr
+	ld	e,a			; set up for double add
+	ld	d,0			; zero upper bits
+	ld	hl,ramaddr		; get base address
+	add	hl,de		 	; hl now points at packet
+	ld	a,(hl)			; get the turbodos length
+	cp	12			; see if packet length is one 
+   	ret	nz			; if not then return
+  	ld	a,(ramaddr+255)		; get the suffix
+	cp	'Z' 			; if it is 'z' then clear bufs
+	ret	nz			; if not then regular packet
+	inc	hl			; point hl at source id
+	inc	hl
+	inc	hl
+	inc	hl
+	ld	e,(hl)			; get source id to de
+	inc  	hl			; high order byte
+	ld	d,(hl)			; move to d
+	ld	(sladr),de		; save the source (slave) id
+	call	srchtbl			; see of id in table
+	or	a			; set flags
+	ret	z			; if z then it is
+	call	addtbl			; if not then add the entry
+	ld	a,-1			; set clear buffer flag
+	ld	(clrbuf),a		; save the flag
+        or	a			; set flags
+	ret
+
+;	this routine adds a new slave network id to the clear buffer
+;	table.
+
+addtbl:	ld	hl,bcipt		; point hl at table base
+at3:	ld	a,(hl)			; get low order byte
+	cp	0ffh			; see if end of table
+	jr	nz,at1			; if not then try next entry
+	inc	hl			; high order byte
+	ld	a,(hl)			; both must be 0ffh
+	cp	0ffh			; see if it is
+	jr	nz,at2			; if not the try again
+	dec	hl			; point hl at first byte
+	ld	(hl),e			; save the low order byte
+	inc	hl			; next byte
+	ld	(hl),d			; save it
+	ld	a,0ffh			; add end of table marker back
+	inc	hl			; move to next entry
+	ld	(hl),a			; save low order byte
+	inc	hl			; save high order byte
+	ld	(hl),a			; saved
+	ret
+
+at1:	inc	hl			; past byte 1
+	inc	hl			; past byte 2
+	jp	at3			; try next byte
+at2:	inc	hl			; past next byte
+	jp	at3
+
+	
+
+; transmit routines (note mutual exclusion)
+
+txmsg:	ld	hl,txmx			; one task xmit at once
+	call	wait##			; wait if others using
+	inc 	de   			; move over linkage
+	inc     de			; step
+	inc	de			; step
+	inc 	de			; step
+
+	call	dwnts2			; see if dest id is being clrd  
+	jp	z,xx1			; yes so flush this packet
+	ld	de,(bptrt)		; get the packet pointer back
+
+	ld	a,(de)			; get the message count
+	cpl				; two's complement count
+	inc	a			; finish two's comp
+	ld	(ramaddr+514),a		; save count in packet
+	ld	e,a			; set up de for addd
+	ld	d,0			; set up
+	ld	hl,ramaddr+512		; set up hl for add
+	add	hl,de			; hl points to msg area
+	ex	de,hl			; de points to msg area
+	ld	hl,(bptrt)		; hl points to message buff
+	ld	a,(hl)			; get the count again
+	ld	c,a			; set up bc for ldir
+	ld	b,0			; set upä	ldir				; move the message
+
+	ld	de,(bptrt)		; de points to message buff
+	inc	de			; de points to dest id
+	ld	a,(de) 			; get the dest id
+	ld	(ramaddr+513),a		; save id in packet
+	inc	de			; skip over net number
+	inc	de			; skip over process id
+	inc	de			; point at source id
+	ld	a,(de)			; get source id
+	ld	(ramaddr+512),a		; save source id
+	ld	a,0			; set xmit flag
+	call	movbuf			; put msg to enet msg buf 
+	ld	bc,(arcbas)		; command port
+	inc	bc			; base+1
+	ld	a,0bh			; xmit from  01
+	out	(c),a			; command the boardç
+
+	ld	de,txpoll		; set up poll routine
+	call	lnkpol##		; linked in
+	ld	hl,txsph		; wait til msg sent
+	call	wait##			; waiting
+
+xx1:	ld	hl,txmx			; let others use
+	call	signal##		; freed
+	xor	a			; clear a
+	ret				; git
+	
+
+;	This routine tests a transmit packet to see if the dest id is being
+;	cleared.  if it is not then we procede with the network communication.
+;	if it is then we check for the length of the packet. if it is zero
+;	then the clear has taken place and we can free up that slave.
+;	the packet is sent. if it is not then we must flush that packet.
+
+dwnts2:	ld	(bptrt),de		; save the packet pointer
+	inc	de			; point de at dest id
+	ld	a,(de)			; get low order byte of id
+	ld	l,a			; move into hl
+	inc	de			; point at high order byte
+	ld	a,(de)			; get the byte
+	ld	h,a			; move into hl
+	ex	de,hl			; de points at dest id
+	call	srchtbl			; see if slave being cleared
+	or	a			; set flags
+	ret	nz			; if not then return
+	ld	hl,(bptrt)		; hl points at message length
+	ld	a,(hl)			; get the message length
+	cp	0			; is it a zero length packet
+	jr	nz,flx			; if not then bad packet
+	ld	a,11			; slave wants to see 11
+	ld	(hl),a			; for length of short packet
+	call	deltbl			; if so then delete table entry 
+	ld	a,-1			; transmit the packet
+	or	a			; set flags
+	ret
+
+flx:	ld	a,0			; indicate no xmit
+	or	a			; set flags
+	ret
+
+;	this routine deletes a table entry from the clear buffers table 
+
+deltbl:	ld      hl,bcipt		; hl points at table
+dt6:	ld	a,(hl)			; get the entry
+	cp	e			; see if low order byte matches
+	jr	nz,dt1			; if not, try next entry
+	inc	hl			; check low order byte
+	ld	a,(hl)			; get the byte
+	cp	d			; see if it checks
+	jr	nz,dt2			; if not then next entry
+	dec	hl		        ;hl points at table entry
+	ld	d,h			; move hl to de
+	ld	e,l			; done
+	inc	de			; move de to next entry
+	inc	de			; de now points at next entry   
+
+;	move (de) to (hl) until (de) and (de+1) = 0ffh
+
+dt4:	ld	a,(de)			; get source byte
+	ld	(hl),a   		; move it
+	cp	0ffh			; see if it is 0ffh
+	jr	z,dt3			; if so then check next byte
+	inc	hl	
+	inc	de			; move both pointers
+	ld	a,(de)			; get next byte
+	ld	(hl),a			; save it
+dt5:	inc	hl			; next entry
+	inc	de			; next entry
+	jp	dt4			; move the next one
+dt3:	inc   	hl			; next byte
+	inc	de			; next byte
+	ld	a,(de)			; get the byte
+	ld	(hl),a			; save it
+	cp	0ffh			; if 0ffh then we are done
+	jr	nz,dt5			; if not look at next entry
+	ret
+
+dt1:	inc	hl			; next byte
+dt2:	inc	hl			; next byte
+	jp	dt6 
+
+; poll routines for recieve
+
+rdpoll:	dw	0			; poll linkage
+	dw	0			; poll linkage
+
+	ld	bc,(arcbas)		; status port
+	in	a,(c)			; get status
+	and	80h			; buffer filled
+	ret	z			; if not then wait
+
+	ld	hl,rxsph		; if so, notify 
+	call	signal##		; the device driver
+	ld	hl,rdpoll		; unlink thyself
+	call	unlink##		; unlinked
+	ret				; return to os
+
+
+; poll routines for transmit 
+
+txpoll:	dw	0			; poll linkage
+	dw	0			; poll linkage
+	
+	ld	bc,(arcbas)		; status port
+	in	a,(c)			; get status
+	and	01h			; transmitter ready again
+	ret	z			; if not then wait
+
+	ld	hl,txsph		; signal device driver
+	call	signal##		; told
+	ld	hl,txpoll		; unlink thyself
+	call	unlink##		; unlinked
+	ret				; get
+
+; receive message buffer, takes enet buffer & move to ramaddr
+; enter: acc=0 transmit,  acc <> 0 receive
+
+movbuf:	push	hl			; save registers
+	push	de
+	push	bc
+	push	af
+	ld	hl,fifomx		; lock fifo access
+	call	wait##
+	pop	af
+	or	a			; if 0 send else receive	
+	jr	z,..tx			; jump if transmet
+	ld	de,0			; buffer  0
+	ld	hl,ramaddr		; set memory msg buf addr
+	call	bufcom			; setup buffer
+	inir				; move in the message
+	inir				; move in the message
+	jr	..sig			; signal fifo
+
+..tx:	ld	de,200h			; buffer  2
+	ld	hl,ramaddr+512		; set memory msg buf addr
+	call	bufcom			; setup buffer
+	otir				; move in the message
+	otir				; move in the message
+
+..sig:	ld	hl,fifomx		; release fifo lock
+	call	signal##
+	pop	bc			; restore registers
+	pop	de
+	pop	hl
+	ret				; done
+
+bufcom:	ld	bc,(arcbas)		; get io base
+	inc	bc			; +1
+	inc	bc			; +2
+	inc	bc			; +3
+	out	(c),e			; clear address low
+	inc	bc			; +4	
+	out	(c),d			; clear address high
+	dec	c			; +3
+	dec	c			; point to arcnet buffer
+	ld	b,0			; set transfer count
+	ret
+
+	end
+
